@@ -27,6 +27,60 @@ except ImportError:
     xops = None
 
 
+# Query-chunked SDPA is used when PyTorch cannot run a fused attention kernel on this
+# device (notably AMD RDNA2, where flash/mem-efficient attention are not compiled).
+# The math backend then materialises the whole L x L score matrix; splitting the query
+# rows keeps the peak temporary at chunk_size x L instead of L x L.
+# The softmax is computed per row over all keys, so chunking does not change the result.
+SDPA_CHUNK_THRESHOLD = 1024  # only chunk when the sequence is long enough to matter
+SDPA_QUERY_CHUNK = 512  # rows per chunk: 512 x 4096 halves the peak vs a full 4096 x 4096 tile
+
+
+def sdpa_auto(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    chunk_size: Optional[int] = None,
+) -> torch.Tensor:
+    """`scaled_dot_product_attention` with a bounded-memory fallback.
+
+    When a fused kernel is available the call is forwarded unchanged. Otherwise (or when
+    ``chunk_size`` is given explicitly) the query rows are processed in chunks. This is
+    mathematically identical to the unchunked call: softmax normalises over the key
+    dimension, which is never split.
+    """
+    seqlen = q.shape[-2]
+    chunk = chunk_size
+    if chunk is None:
+        from library import rocm_utils
+
+        if seqlen < SDPA_CHUNK_THRESHOLD or rocm_utils.sdpa_fused_available():
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        if q.dtype == torch.float16:
+            # On gfx1030 the math-attention backward over sliced fp16 queries segfaulted inside the
+            # Anima trainer (bf16 is stable). fp16 at 1024x1024 also fits in 16 GiB without chunking,
+            # so keep the plain call for fp16 and only chunk the bf16/fp32 paths.
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        chunk = SDPA_QUERY_CHUNK
+
+    if chunk >= seqlen or chunk <= 0:
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+
+    out = []
+    for start in range(0, seqlen, chunk):
+        # q is usually a transposed view; make the chunk dense. Some ROCm builds segfault in the
+        # math-attention backward for non-contiguous query slices (seen on gfx1030).
+        q_chunk = q[..., start : start + chunk, :]
+        if not q_chunk.is_contiguous():
+            q_chunk = q_chunk.contiguous()
+        out.append(
+            torch.nn.functional.scaled_dot_product_attention(q_chunk, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        )
+    return torch.cat(out, dim=-2)
+
+
 @dataclass
 class AttentionParams:
     attn_mode: Optional[str] = None
@@ -190,7 +244,7 @@ def attention(
             q = k = v = None
 
         else:
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate)
+            x = sdpa_auto(q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate)
             q = k = v = None
 
     elif attn_params.attn_mode == "xformers":

@@ -684,3 +684,49 @@ The following metadata is saved in the LoRA model file:
 * `ss_discrete_flow_shift`
 
 </details>
+## 8. AMD GPUs (ROCm) / AMD GPU (ROCm)
+
+sd-scripts detects ROCm at startup and logs the GPU and architecture (for example `gfx1030 (RDNA2)`).
+Three things then change automatically. All of them are numerically equivalent to the previous
+defaults (the 2D VAE is converted from the same weights and produces the same latents for single
+images), so trained weights and LoRA files stay compatible.
+
+* **VAE implementation**: the image-only 2D Qwen-Image VAE is used by default; `--qwen_image_vae_3d`
+  forces the official 3D (causal Conv3d) VAE. On an RX 6800 a 1024x1024 encode costs about
+  0.27 s / 2.6 GiB with the 2D VAE versus about 1.8 s / 7.2 GiB with the 3D one. With the DiT
+  already resident, the 3D VAE is what tips a 16 GiB card into OOM during latent caching.
+* **VAE dtype**: `--vae_dtype auto` (default) uses fp32 on RDNA GPUs. RDNA has no matrix cores and
+  there is no fast bf16 convolution path for these shapes (a 3x3 convolution at 1024x1024 takes
+  about 33 ms in bf16 vs 5 ms in fp16 and 12 ms in fp32), and the 3D VAE additionally allocates
+  fp32-sized buffers internally. fp32 is therefore both faster and exact. Use
+  `--vae_dtype fp16|bf16|fp32` to override.
+* **Attention**: PyTorch ships no flash, memory-efficient or cuDNN attention kernel for gfx1030, so
+  `scaled_dot_product_attention` silently falls back to the `math` backend, which materialises the
+  full L x L score matrix. At 1024x1024 Anima latents (L=4096, 16 heads) that is a ~0.5 GiB temporary
+  per call and ~4.2 GiB peak with backward, per transformer block. When no fused kernel is available,
+  `library.attention` now processes the query rows in chunks instead: the softmax is still normalised
+  over all keys, so the result is unchanged, while the peak drops to roughly half. This is what makes
+  1024x1024 comfortable on a 16 GiB card.
+
+### Mixed precision on RDNA / RDNAでの混合精度
+
+Measured on an RX 6800 (gfx1030, ROCm 7.2), LoRA rank 8, 1024x1024, batch size 1, gradient
+checkpointing, cached latents and text encoder outputs:
+
+| dtype | GEMM (4096x8192x2048) | 3x3 conv 1024x1024 | training step |
+|-------|----------------------|--------------------|---------------|
+| bf16  | ~6.6 TFLOP/s         | ~33 ms             | ~15.4 s       |
+| fp16  | ~22 TFLOP/s          | ~5 ms              | ~8.9 s        |
+| fp32  | ~12 TFLOP/s          | ~12 ms             | (not tested)  |
+
+RDNA2 has no matrix cores and neither hipBLASLt nor the CK backend supports gfx1030, so bf16 is
+emulated and ends up *slower than fp32*. The DiT is GEMM-bound at 1024x1024, which makes
+`--mixed_precision fp16` about 1.7x faster than bf16 on this hardware. fp16 also has a wider
+mantissa (10 bits vs 7); as with any fp16 run, watch for overflow.
+
+The automatic attention chunking is intentionally not applied to fp16: on this ROCm build the
+math-attention backward over sliced fp16 queries segfaulted inside the trainer, while bf16 is
+stable. An fp16 run at 1024x1024 fits in 16 GiB without chunking, so use fp16 for speed and bf16
+when you need the lower peak. (A Triton flash-attention kernel was also evaluated: Triton reaches
+only ~3 TFLOP/s for `tl.dot` on gfx1030, making it about 5x slower than the math path, so it is not
+used.)

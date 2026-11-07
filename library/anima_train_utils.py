@@ -144,13 +144,56 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         help="Use the image-only 2D Qwen-Image VAE implementation. Official Qwen-Image VAE weights are converted on load."
         + " / 画像専用の2D Qwen-Image VAE実装を使用します。公式Qwen-Image VAEの重みはロード時に変換されます。",
     )
+    parser.add_argument(
+        "--qwen_image_vae_3d",
+        action="store_true",
+        help="Force the official 3D (causal Conv3d) Qwen-Image VAE. On ROCm the equivalent 2D implementation is used by default: "
+        "the 3D VAE needs ~7 GiB and ~1.8 s per 1024x1024 encode on an RX 6800, the 2D one ~2.6 GiB and ~0.3 s, with equal latents."
+        " / 公式の3D (causal Conv3d) Qwen-Image VAEを強制します。ROCmでは等価な2D実装がデフォルトです。",
+    )
+    parser.add_argument(
+        "--vae_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp16", "bf16", "fp32"],
+        help="Compute dtype for the VAE. 'auto' keeps the training dtype, except on RDNA GPUs where fp32 is used: "
+        "there bf16 convolutions are emulated (3-7x slower) and fp32 matches the reference latents exactly."
+        " / VAEの計算dtype。autoは学習dtypeを使います（RDNA GPUではfp32）。",
+    )
 
     # torch.compile (per-block compilation, Triton required) and CUDA performance switches
     compile_utils.add_compile_arguments(parser)
 
 
+def resolve_vae_dtype(args, weight_dtype: torch.dtype) -> torch.dtype:
+    """Return the dtype the VAE should run in.
+
+    On RDNA the bf16 convolution path is emulated (no matrix cores) and is both slower
+    than fp32 and internally upcast, so the fp32 VAE is the cheapest *exact* option.
+    Anywhere else the training dtype is kept, which is what previous versions did.
+    """
+    from library import rocm_utils
+
+    explicit = getattr(args, "vae_dtype", "auto") or "auto"
+    if explicit != "auto":
+        return {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[explicit]
+    if rocm_utils.is_rdna():
+        return torch.float32
+    return weight_dtype
+
+
 def load_qwen_image_vae(args, device="cpu", disable_mmap: bool = True):
-    if getattr(args, "qwen_image_vae_2d", False):
+    from library import rocm_utils
+
+    use_2d = bool(getattr(args, "qwen_image_vae_2d", False))
+    if not use_2d and not getattr(args, "qwen_image_vae_3d", False) and rocm_utils.is_rocm():
+        use_2d = True
+        logger.info(
+            "ROCm detected: using the image-only 2D Qwen-Image VAE (numerically equivalent to the 3D VAE for single images). "
+            "Pass --qwen_image_vae_3d to force the official 3D implementation."
+        )
+
+    if use_2d:
         from library import qwen_image_autoencoder_kl_2d
 
         logger.info("Using image-only Qwen-Image 2D VAE")

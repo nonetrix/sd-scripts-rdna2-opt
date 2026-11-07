@@ -20,6 +20,7 @@ from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGr
 from packaging.version import Version
 
 import library.deepspeed_utils as deepspeed_utils
+import library.rocm_utils as rocm_utils
 from library.utils import setup_logging
 
 setup_logging()
@@ -150,6 +151,11 @@ def prepare_accelerator(args: argparse.Namespace):
         deepspeed_plugin=deepspeed_plugin,
     )
     print("accelerator device:", accelerator.device)
+
+    # No-op unless this is a ROCm build: logs the GPU/arch and the available fast paths,
+    # so that AMD users can see why a given dtype/attention path was chosen.
+    rocm_utils.apply_rocm_optimizations(args)
+
     return accelerator
 
 

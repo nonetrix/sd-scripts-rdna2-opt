@@ -107,7 +107,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Load VAE
         logger.info("Loading Anima VAE...")
         vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
-        vae.to(weight_dtype)
+        vae_dtype = anima_train_utils.resolve_vae_dtype(args, weight_dtype)
+        logger.info(f"VAE dtype: {vae_dtype} (training dtype: {weight_dtype})")
+        vae.to(vae_dtype)
         vae.eval()
 
         # Return format: (model_type, text_encoders, vae, unet)

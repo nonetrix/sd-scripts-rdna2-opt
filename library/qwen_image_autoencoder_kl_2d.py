@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from library.attention import sdpa_auto
 from library.qwen_image_autoencoder_kl import (
     ChunkedConv2d,
     DiagonalGaussianDistribution,
@@ -65,7 +66,10 @@ class QwenImageAttentionBlock2D(nn.Module):
         qkv = qkv.reshape(batch_size, 1, channels * 3, -1)
         qkv = qkv.permute(0, 1, 3, 2).contiguous()
         q, k, v = qkv.chunk(3, dim=-1)
-        x = F.scaled_dot_product_attention(q, k, v)
+        # At 1024x1024 this block attends over 16384 tokens: the unchunked math fallback
+        # (used on AMD RDNA2, which has no fused SDPA kernel) would need ~0.5 GiB of
+        # score matrix here. sdpa_auto keeps the exact same math with bounded memory.
+        x = sdpa_auto(q, k, v)
         x = x.squeeze(1).permute(0, 2, 1).reshape(batch_size, channels, height, width)
         x = self.proj(x)
         return x + identity
