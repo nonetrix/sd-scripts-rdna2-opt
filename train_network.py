@@ -1186,6 +1186,16 @@ class NetworkTrainer:
         # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
 
+        # On ROCm the worker processes open the GPU and wedge the driver: training freezes
+        # after a handful of steps with the process still alive and VRAM released. It happens
+        # with both the fork and spawn start methods, and costs no measurable speed to avoid
+        # (7.54 s/it without workers vs 7.63 s/it with four), so read batches in-process.
+        if n_workers > 0 and torch.version.hip is not None:
+            logger.warning(
+                f"disabling {n_workers} dataloader workers on ROCm to avoid a driver hang; batches are loaded in the main process"
+            )
+            n_workers = 0
+
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,

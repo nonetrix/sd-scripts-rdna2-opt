@@ -1,6 +1,7 @@
 # Anima LoRA training script
 
 import argparse
+import time
 from typing import Any, Optional, Union
 
 import torch
@@ -36,9 +37,44 @@ logger = logging.getLogger(__name__)
 
 
 class AnimaNetworkTrainer(train_network.NetworkTrainer):
+    # Keep this much device memory free by dropping cached blocks when it runs low.
+    # Bucketed training at 1024 needs ~15.4 GiB of a 16 GiB card, and the dataloader
+    # workers' shared buffers tip a run that is this close to the limit over the edge,
+    # so hold back real headroom instead of waiting for the allocator to fail.
+    VRAM_HEADROOM_GIB = 4.0
+
     def __init__(self):
         super().__init__()
+        self._last_vram_release = 0.0
+        self._last_vram_log = 0.0
         self.sample_prompts_te_outputs = None
+
+    def release_vram_cache_if_needed(self, device) -> None:
+        """Release cached allocator blocks when the device is nearly full.
+
+        The caching allocator retains freed segments, and with bucketed training every new
+        bucket shape needs different sized segments. The retained pool can then fill the
+        device while live tensors use less than half of it, and the next bucket fails to
+        allocate. Releasing the cache costs no precision and keeps the run inside the card.
+        """
+        if not torch.cuda.is_available():
+            return
+
+        free, _total = torch.cuda.mem_get_info(device)
+        if free >= self.VRAM_HEADROOM_GIB * 2**30:
+            return
+
+        now = time.monotonic()
+        if now - self._last_vram_release < 5.0:
+            # Releasing is only cheap when it is rare: emptying the cache forces a fresh
+            # allocation on the next step, so never do it every step.
+            return
+        if now - self._last_vram_log >= 60.0:
+            logger.info(f"free VRAM {free / 2**30:.2f} GiB, releasing cached allocator blocks")
+            self._last_vram_log = now
+        self._last_vram_release = now
+        # torch.cuda.empty_cache() only: gc.collect() would cost more than the OOM it prevents.
+        torch.cuda.empty_cache()
 
     def assert_extra_args(
         self,
@@ -374,6 +410,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         train_unet=True,
     ) -> torch.Tensor:
         """Override base process_batch for caption dropout with cached text encoder outputs."""
+        self.release_vram_cache_if_needed(accelerator.device)
 
         # Text encoder conditions
         text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
