@@ -730,3 +730,22 @@ stable. An fp16 run at 1024x1024 fits in 16 GiB without chunking, so use fp16 fo
 when you need the lower peak. (A Triton flash-attention kernel was also evaluated: Triton reaches
 only ~3 TFLOP/s for `tl.dot` on gfx1030, making it about 5x slower than the math path, so it is not
 used.)
+
+### What does not help on RDNA2 (measured) / RDNA2で効果がなかった設定
+
+All of the following were tried on the same setup (1024x1024, LoRA rank 8, RX 6800):
+
+* **Disabling `--gradient_checkpointing`**: OOMs. Without it PyTorch allocated 13.8 GiB (fp16) and
+  15.4 GiB (bf16) before failing, so checkpointing is mandatory at this resolution.
+* **Per-block `--compile` (torch.compile/Triton inductor)**: 10.3 s/it versus 8.5 s/it without it,
+  i.e. about 20% slower once the compiled blocks are in place.
+* **`--vae_batch_size` above 2**: the 2D VAE runs in fp32 on RDNA and each 1024x1024 image needs
+  ~2.6 GiB while encoding, so a batch of 8 requests an 8 GiB attention temporary and OOMs.
+* **`PYTORCH_HIP_ALLOC_CONF=expandable_segments:True`**: on this ROCm build every allocation goes
+  through `hipMemMap` (~18 ms each, ~1000 per step), which adds seconds per step and does not
+  reduce peak usage. Leave it unset.
+* **A hand written Triton flash-attention kernel**: Triton `tl.dot` reaches only ~3 TFLOP/s on
+  gfx1030, making it about 5x slower than the math path, even though it uses far less memory.
+
+The remaining cost is the `math` attention backward plus GEMMs, for which no faster kernel exists for
+gfx1030 in this ROCm build. Realistically, `--mixed_precision fp16` is the last large lever here.

@@ -2,10 +2,60 @@
 
 [English](./README.md) / [日本語](./README-ja.md)
 
+> [!WARNING]
+> **This is a personal fork: it is entirely vibe coded with an AI agent, and stability is not
+> guaranteed.** It has not been audited or tested beyond the AMD RDNA2 scenarios described
+> below; expect rough edges, unverified assumptions and changes that could affect unrelated
+> models or training modes. Keep backups of your datasets and checkpoints, and prefer
+> upstream [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) for production work.
+> Everything here is experimental and used at your own risk.
+>
+> The fork's changes target AMD RDNA2 (ROCm) GPUs. They are gated behind runtime ROCm
+> detection, so non-AMD behaviour is intended to be unchanged — but see the disclaimer above.
+
+## Quick start: Anima LoRA on an AMD RDNA2 GPU
+
+This is the exact configuration that was measured on an RX 6800 (gfx1030, ROCm 7.2, 16 GiB):
+~8.5 s per 1024x1024 step with 8.5 GiB peak VRAM. See
+[AMD GPUs (ROCm)](./docs/anima_train_network.md#8-amd-gpus-rocm-amd-gpu-rocm) for the
+reasoning and the measured numbers.
+
+```bash
+accelerate launch --num_cpu_threads_per_process 1 anima_train_network.py \
+  --pretrained_model_name_or_path="/path/to/anima-base-v1.0.safetensors" \
+  --qwen3="/path/to/qwen_3_06b_base.safetensors" \
+  --vae="/path/to/qwen_image_vae.safetensors" \
+  --dataset_config="my_anima_dataset.toml" \
+  --output_dir="out" \
+  --output_name="anima_lora" \
+  --network_module=networks.lora_anima \
+  --network_dim=8 --network_alpha=1 \
+  --network_train_unet_only \
+  --learning_rate=1e-4 \
+  --optimizer_type=AdamW --lr_scheduler=constant \
+  --mixed_precision=fp16 \
+  --gradient_checkpointing \
+  --cache_latents --cache_text_encoder_outputs \
+  --vae_chunk_size=64 \
+  --max_train_epochs=10 --save_every_n_epochs=1
+```
+
+Notes for AMD cards:
+
+* `--mixed_precision=fp16` is ~1.8x faster than `bf16` on RDNA2 (which has no matrix cores and
+  emulates bf16). Use `bf16` instead if you need the lower peak VRAM.
+* `--gradient_checkpointing` is required at 1024x1024: without it both fp16 and bf16 run out of
+  memory on a 16 GiB card.
+* Do not raise `--vae_batch_size` above 1-2 here: the VAE now runs in fp32 on RDNA and each
+  1024x1024 image needs ~2.6 GiB while caching.
+* The 2D VAE is selected automatically on ROCm; pass `--qwen_image_vae_3d` to force the
+  official 3D VAE, and `--vae_dtype fp16|bf16|fp32` to change its compute dtype.
+
 ## Table of Contents
 <details>
 <summary>Click to expand</summary>
 
+- [Quick start: Anima LoRA on an AMD RDNA2 GPU](#quick-start-anima-lora-on-an-amd-rdna2-gpu)
 - [Introduction](#introduction)
     - [Supported Models](#supported-models)
     - [Features](#features)
