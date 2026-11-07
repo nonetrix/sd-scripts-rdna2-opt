@@ -48,6 +48,11 @@ Notes for AMD cards:
   memory on a 16 GiB card.
 * Do not raise `--vae_batch_size` above 1-2 here: the VAE now runs in fp32 on RDNA and each
   1024x1024 image needs ~2.6 GiB while caching.
+* Mixed-bucket 1024x1024 datasets peak much higher than the fixed-size case above (~14 GiB
+  instead of 8.5 GiB). On a 16 GiB card add `--blocks_to_swap=10`: without it the run dies a few
+  dozen steps in with an uncaught `std::bad_variant_access` from the HIP backend once VRAM
+  reaches ~15.4 GiB. That error looks like a scheduler bug but is an allocation failure. The
+  measured cost is nil (7.62 vs 7.54 s/it).
 * The 2D VAE is selected automatically on ROCm; pass `--qwen_image_vae_3d` to force the
   official 3D VAE, and `--vae_dtype fp16|bf16|fp32` to change its compute dtype.
 
