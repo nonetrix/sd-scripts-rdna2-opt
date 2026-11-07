@@ -968,6 +968,18 @@ class NetworkTrainer:
             train_dataset_group = dataset_util.load_arbitrary_dataset(args)
             val_dataset_group = None  # placeholder until validation dataset supported for arbitrary
 
+        # On ROCm the worker processes open the GPU and wedge the driver: training freezes
+        # after a handful of steps with the process still alive and its VRAM released. It
+        # happens with both the fork and spawn start methods, and avoiding it costs no
+        # measurable speed (7.54 s/it without workers vs 7.63 s/it with four), so read the
+        # batches in-process. Set the argument itself so the collator below agrees.
+        if args.max_data_loader_n_workers > 0 and torch.version.hip is not None:
+            logger.warning(
+                f"disabling {args.max_data_loader_n_workers} dataloader workers on ROCm to avoid a driver hang; "
+                "batches are loaded in the main process"
+            )
+            args.max_data_loader_n_workers = 0
+
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
@@ -1186,23 +1198,13 @@ class NetworkTrainer:
         # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
 
-        # On ROCm the worker processes open the GPU and wedge the driver: training freezes
-        # after a handful of steps with the process still alive and VRAM released. It happens
-        # with both the fork and spawn start methods, and costs no measurable speed to avoid
-        # (7.54 s/it without workers vs 7.63 s/it with four), so read batches in-process.
-        if n_workers > 0 and torch.version.hip is not None:
-            logger.warning(
-                f"disabling {n_workers} dataloader workers on ROCm to avoid a driver hang; batches are loaded in the main process"
-            )
-            n_workers = 0
-
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,
             shuffle=True,
             collate_fn=collator,
             num_workers=n_workers,
-            persistent_workers=args.persistent_data_loader_workers,
+            persistent_workers=args.persistent_data_loader_workers and n_workers > 0,
         )
 
         val_dataloader = torch.utils.data.DataLoader(
@@ -1211,7 +1213,7 @@ class NetworkTrainer:
             batch_size=1,
             collate_fn=collator,
             num_workers=n_workers,
-            persistent_workers=args.persistent_data_loader_workers,
+            persistent_workers=args.persistent_data_loader_workers and n_workers > 0,
         )
 
         # 学習ステップ数を計算する
