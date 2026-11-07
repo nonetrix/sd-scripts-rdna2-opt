@@ -1058,18 +1058,11 @@ class AutoencoderKLQwenImage(nn.Module):  # ModelMixin, ConfigMixin, FromOrigina
         self._enc_feat_map = None  # Disable encoder cache
 
     def clear_cache(self):
-        def _count_conv3d(model):
-            count = 0
-            for m in model.modules():
-                if isinstance(m, QwenImageCausalConv3d):
-                    count += 1
-            return count
-
-        self._conv_num = _count_conv3d(self.decoder)
+        self._conv_num = self._cached_conv_counts["decoder"]
         self._conv_idx = [0]
         self._feat_map = [None] * self._conv_num
         # cache encode
-        self._enc_conv_num = _count_conv3d(self.encoder)
+        self._enc_conv_num = self._cached_conv_counts["encoder"]
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
 
@@ -1080,22 +1073,30 @@ class AutoencoderKLQwenImage(nn.Module):  # ModelMixin, ConfigMixin, FromOrigina
         if self.use_tiling and (width > self.tile_sample_min_width or height > self.tile_sample_min_height):
             return self.tiled_encode(x)
 
-        self.clear_cache()
+        # The causal feature cache only feeds the *next* temporal chunk. A single image has no next chunk,
+        # so the cache would hold full-resolution clones that are never read: skip the cache entirely for
+        # single frames. The output is bit-identical (the first chunk never reads the cache either) and it
+        # avoids ~2 GiB of video-only workspace for a 1024x1024 image. T>1 keeps the cached behaviour.
+        use_cache = num_frame > 1 and not self.cache_disabled
+        if use_cache:
+            self.clear_cache()
+        feat_cache = self._enc_feat_map if use_cache else None
         iter_ = 1 + (num_frame - 1) // 4
         for i in range(iter_):
             self._enc_conv_idx = [0]
             if i == 0:
-                out = self.encoder(x[:, :, :1, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                out = self.encoder(x[:, :, :1, :, :], feat_cache=feat_cache, feat_idx=self._enc_conv_idx)
             else:
                 out_ = self.encoder(
                     x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :],
-                    feat_cache=self._enc_feat_map,
+                    feat_cache=feat_cache,
                     feat_idx=self._enc_conv_idx,
                 )
                 out = torch.cat([out, out_], 2)
 
         enc = self.quant_conv(out)
-        self.clear_cache()
+        if use_cache:
+            self.clear_cache()
         return enc
 
     # @apply_forward_hook
@@ -1133,18 +1134,23 @@ class AutoencoderKLQwenImage(nn.Module):  # ModelMixin, ConfigMixin, FromOrigina
         if self.use_tiling and (width > tile_latent_min_width or height > tile_latent_min_height):
             return self.tiled_decode(z, return_dict=return_dict)
 
-        self.clear_cache()
+        # Same as in _encode: a single latent frame has no next chunk, so the decoder cache is pure overhead.
+        use_cache = num_frame > 1 and not self.cache_disabled
+        if use_cache:
+            self.clear_cache()
+        feat_cache = self._feat_map if use_cache else None
         x = self.post_quant_conv(z)
         for i in range(num_frame):
             self._conv_idx = [0]
             if i == 0:
-                out = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                out = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=feat_cache, feat_idx=self._conv_idx)
             else:
-                out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                out_ = self.decoder(x[:, :, i : i + 1, :, :], feat_cache=feat_cache, feat_idx=self._conv_idx)
                 out = torch.cat([out, out_], 2)
 
         out = torch.clamp(out, min=-1.0, max=1.0)
-        self.clear_cache()
+        if use_cache:
+            self.clear_cache()
         if not return_dict:
             return (out,)
 

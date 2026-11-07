@@ -695,6 +695,11 @@ images), so trained weights and LoRA files stay compatible.
   forces the official 3D (causal Conv3d) VAE. On an RX 6800 a 1024x1024 encode costs about
   0.27 s / 2.6 GiB with the 2D VAE versus about 1.8 s / 7.2 GiB with the 3D one. With the DiT
   already resident, the 3D VAE is what tips a 16 GiB card into OOM during latent caching.
+  Independently of that, both VAE implementations skip the temporal feature cache for single
+  frames: the cache only feeds the *next* video chunk, so for an image it holds full-resolution
+  clones that are never read. Skipping it is bit-identical and lowers a 1024x1024 encode from
+  5.66 GiB to 3.51 GiB with the 3D VAE. Inputs with more than one frame (video) still use the
+  cache exactly as before.
 * **VAE dtype**: `--vae_dtype auto` (default) uses fp32 on RDNA GPUs. RDNA has no matrix cores and
   there is no fast bf16 convolution path for these shapes (a 3x3 convolution at 1024x1024 takes
   about 33 ms in bf16 vs 5 ms in fp16 and 12 ms in fp32), and the 3D VAE additionally allocates
@@ -748,4 +753,12 @@ All of the following were tried on the same setup (1024x1024, LoRA rank 8, RX 68
   gfx1030, making it about 5x slower than the math path, even though it uses far less memory.
 
 The remaining cost is the `math` attention backward plus GEMMs, for which no faster kernel exists for
-gfx1030 in this ROCm build. Realistically, `--mixed_precision fp16` is the last large lever here.
+gfx1030 in this ROCm build. A `torch.profiler` run of a bf16 step confirms the split: about
+10.5 s of the 15.4 s step is `aten::mm` (bf16 GEMM, ~6.6 TFLOP/s), ~3.3 s is the attention `bmm`,
+and the rest is elementwise work. Realistically, `--mixed_precision fp16` is the last large lever
+here: it is not a precision downgrade for training (fp16 carries 10 mantissa bits versus bf16's 7),
+it is a different numerical path that happens to use the hardware's fast matrix units.
+
+Using the fp16 matrix path to accelerate bf16 by rescaling bf16 tensors into fp16's exponent range
+was considered and rejected: bf16 spans a far larger exponent range, so wide-dynamic-range
+activations would silently flush to zero. That is a real quality loss, not a rounding difference.
